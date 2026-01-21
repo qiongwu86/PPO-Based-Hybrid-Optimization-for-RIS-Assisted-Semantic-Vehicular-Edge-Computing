@@ -1,0 +1,271 @@
+import numpy as np
+import copy
+import math
+
+# 导入配置 (确保与你的环境一致)
+from environment import N_VEHICLES, N_RIS_ELEMENTS, TASK_SIZE_MBIT
+
+class GeneticAlgorithmSolver:
+    def __init__(self, 
+                 pop_size=50, 
+                 generations=50, 
+                 crossover_rate=0.8, 
+                 mutation_rate=0.1, 
+                 elite_size=2):
+        """
+        初始化遗传算法求解器
+        :param pop_size: 种群大小
+        :param generations: 迭代次数
+        :param crossover_rate: 交叉概率
+        :param mutation_rate: 变异概率
+        :param elite_size: 精英保留数量
+        """
+        self.pop_size = pop_size
+        self.generations = generations
+        self.crossover_rate = crossover_rate
+        self.mutation_rate = mutation_rate
+        self.elite_size = elite_size
+        
+        # === 基因编码结构 ===
+        # 1. RIS相位: [0, N_RIS) -> continuous [0, 2pi]
+        # 2. K值: [N_RIS, N_RIS + N_VEH) -> integer [1, 20]
+        # 3. Lambda权重: [N_RIS + N_VEH, End) -> continuous [0, 1] (每车3个权重: Local, Edge, BS)
+        
+        self.idx_ris_end = N_RIS_ELEMENTS
+        self.idx_k_end = N_RIS_ELEMENTS + N_VEHICLES
+        self.idx_lam_end = N_RIS_ELEMENTS + N_VEHICLES + (3 * N_VEHICLES)
+        
+        self.chromosome_len = self.idx_lam_end
+
+    def init_population(self):
+        """初始化种群"""
+        pop = np.zeros((self.pop_size, self.chromosome_len))
+        
+        # 1. RIS 相位 [0, 2pi]
+        pop[:, :self.idx_ris_end] = np.random.uniform(0, 2*np.pi, (self.pop_size, N_RIS_ELEMENTS))
+        
+        # 2. K值 [1, 20]
+        # 注意：虽然存储为浮点，但在使用时取整
+        pop[:, self.idx_ris_end:self.idx_k_end] = np.random.randint(1, 21, (self.pop_size, N_VEHICLES))
+        
+        # 3. Lambda 权重 [0, 1]
+        pop[:, self.idx_k_end:] = np.random.uniform(0, 1, (self.pop_size, 3 * N_VEHICLES))
+        
+        return pop
+
+    def decode_individual(self, individual):
+        """
+        将染色体解码为具体的物理意义参数
+        """
+        # A. RIS 相位
+        ris_phases = individual[:self.idx_ris_end]
+        
+        # B. K 值 (取整)
+        k_values = np.round(individual[self.idx_ris_end:self.idx_k_end]).astype(int)
+        k_values = np.clip(k_values, 1, 20)
+        
+        # C. Lambda 比例 (归一化)
+        raw_lam = individual[self.idx_k_end:].reshape(N_VEHICLES, 3)
+        # 防止除零
+        sum_lam = np.sum(raw_lam, axis=1, keepdims=True) + 1e-9
+        lambdas = raw_lam / sum_lam # (N_Veh, 3) -> [Local, Edge, BS]
+        
+        return ris_phases, k_values, lambdas
+
+    def evaluate_fitness(self, population, env_snapshot):
+        """
+        计算适应度
+        注意：我们需要在这个函数里“临时”修改环境的RIS相位来计算SINR，
+        但不能调用 step_movement，因为GA是在同一个时间步内搜索。
+        """
+        fitness_scores = []
+        
+        # 备份原始RIS相位，以免影响外部环境
+        original_phases = env_snapshot.ris.phases.copy()
+        
+        # 任务大小 (bits)
+        task_bits = TASK_SIZE_MBIT * 1e6
+        
+        for i in range(self.pop_size):
+            ind = population[i]
+            ris_phases, k_values, lambdas = self.decode_individual(ind)
+            
+            # 1. 设置环境 RIS (为了计算 V2I SINR)
+            env_snapshot.ris.set_phases(ris_phases)
+            # 重新计算静态信道组合部分 (H_total = H_d + H_rd * Phi * H_sr)
+            # 注意：环境类中获取 SINR 的函数通常会用到当前 RIS 状态
+            
+            max_delays = []
+            
+            # 2. 遍历所有车辆计算时延
+            for v_idx in range(N_VEHICLES):
+                k_val = k_values[v_idx]
+                lam_loc, lam_edge, lam_bs = lambdas[v_idx]
+                
+                # 获取 SINR
+                srv_idx, _ = env_snapshot.find_nearest_service_vehicle(v_idx)
+                
+                snr_v2v = 1e-10
+                if srv_idx != -1:
+                    # 使用环境内置函数，它会基于当前车辆位置计算
+                    snr_v2v = env_snapshot.get_v2v_sinr(v_idx, srv_idx)
+                
+                # 获取 V2I SINR (受 RIS 影响)
+                snr_v2i = env_snapshot.get_v2i_sinr(v_idx)
+                
+                # 计算 A 参数 (单位负载时延)
+                A_l, A_e, A_b = env_snapshot.calculate_delay_coefficients(
+                    task_bits, snr_v2v, snr_v2i, k_val
+                )
+                
+                # 计算实际时延 (三者并行，取最大值)
+                d_loc = A_l * lam_loc
+                d_edge = A_e * lam_edge
+                d_bs = A_b * lam_bs
+                
+                # 车辆的总时延取决于最慢的那个分流
+                veh_total_delay = max(d_loc, d_edge, d_bs)
+                max_delays.append(veh_total_delay)
+            
+            # 3. 系统目标：最小化所有车辆中的最大时延 (Min-Max)
+            # 或者最小化平均时延。这里为了跟 PPO 对齐，我们使用 Min-Max
+            system_objective = np.max(max_delays) # + 0.1 * np.mean(max_delays)
+            
+            # 适应度 = -目标值 (GA 是最大化适应度)
+            fitness_scores.append(-system_objective)
+            
+        # 恢复环境
+        env_snapshot.ris.set_phases(original_phases)
+        
+        return np.array(fitness_scores)
+
+    def select(self, population, fitness):
+        """锦标赛选择"""
+        new_pop = np.zeros_like(population)
+        # 精英保留
+        sorted_indices = np.argsort(fitness)[::-1] # 降序
+        new_pop[:self.elite_size] = population[sorted_indices[:self.elite_size]]
+        
+        for i in range(self.elite_size, self.pop_size):
+            # 随机选 3 个打比赛
+            candidates_idx = np.random.randint(0, self.pop_size, 3)
+            best_idx = candidates_idx[np.argmax(fitness[candidates_idx])]
+            new_pop[i] = population[best_idx]
+            
+        return new_pop
+
+    def crossover(self, population):
+        """均匀交叉"""
+        new_pop = population.copy()
+        # 从精英之后开始交叉
+        for i in range(self.elite_size, self.pop_size, 2):
+            if i + 1 >= self.pop_size: break
+            
+            if np.random.rand() < self.crossover_rate:
+                # 随机生成掩码
+                mask = np.random.rand(self.chromosome_len) < 0.5
+                parent1 = population[i]
+                parent2 = population[i+1]
+                
+                child1 = np.where(mask, parent1, parent2)
+                child2 = np.where(mask, parent2, parent1)
+                
+                new_pop[i] = child1
+                new_pop[i+1] = child2
+        return new_pop
+
+    def mutate(self, population):
+        """高斯变异"""
+        # 同样保留精英不因变异丢失
+        for i in range(self.elite_size, self.pop_size):
+            if np.random.rand() < self.mutation_rate:
+                # 对个体的某些基因添加噪声
+                mutation_mask = np.random.rand(self.chromosome_len) < 0.1 # 10% 的基因发生突变
+                
+                # RIS 相位变异
+                noise_ris = np.random.normal(0, 0.5, N_RIS_ELEMENTS)
+                
+                # K 值变异 (整数跳变)
+                noise_k = np.random.randint(-2, 3, N_VEHICLES)
+                
+                # Lambda 权重变异
+                noise_lam = np.random.normal(0, 0.2, 3 * N_VEHICLES)
+                
+                noise_total = np.concatenate([noise_ris, noise_k, noise_lam])
+                
+                population[i] += mutation_mask * noise_total
+                
+                # 边界截断修复
+                # RIS
+                population[i, :self.idx_ris_end] = np.mod(population[i, :self.idx_ris_end], 2*np.pi)
+                # K
+                population[i, self.idx_ris_end:self.idx_k_end] = np.clip(
+                    population[i, self.idx_ris_end:self.idx_k_end], 1, 20
+                )
+                # Lambda Weights
+                population[i, self.idx_k_end:] = np.clip(
+                    population[i, self.idx_k_end:], 0.01, 1.0
+                )
+                
+        return population
+
+    def solve(self, env_snapshot, verbose=False):
+        """
+        主求解函数
+        :param env_snapshot: 当前环境对象 (GA不会修改其内部物理状态)
+        :return: best_ris_phases, best_k_values, best_lambdas, best_delay
+        """
+        population = self.init_population()
+        
+        best_fitness_history = []
+        best_solution = None
+        best_score = -float('inf')
+        
+        for gen in range(self.generations):
+            fitness = self.evaluate_fitness(population, env_snapshot)
+            
+            # 记录本代最佳
+            gen_best_idx = np.argmax(fitness)
+            if fitness[gen_best_idx] > best_score:
+                best_score = fitness[gen_best_idx]
+                best_solution = population[gen_best_idx].copy()
+            
+            best_fitness_history.append(best_score)
+            
+            if verbose and gen % 10 == 0:
+                print(f"GA Gen {gen}: Min Delay = {-best_score:.4f} s")
+            
+            # 进化操作
+            population = self.select(population, fitness)
+            population = self.crossover(population)
+            population = self.mutate(population)
+            
+        # 解码最终最优解
+        best_ris, best_k, best_lam = self.decode_individual(best_solution)
+        return best_ris, best_k, best_lam, -best_score
+
+# ================= 单元测试与使用示例 =================
+if __name__ == "__main__":
+    from environment import Environ
+    
+    # 1. 创建环境
+    env = Environ(n_vehicles=N_VEHICLES, dt=0.1)
+    
+    # 2. 初始化 GA 求解器
+    # 注意：为了速度，测试时 pop_size 和 generations 可以设小一点
+    ga_solver = GeneticAlgorithmSolver(pop_size=30, generations=20)
+    
+    print("Running GA Optimization for one step...")
+    
+    # 3. 运行 GA
+    # 假设这是仿真循环中的某一步
+    ris, k, lam, delay = ga_solver.solve(env, verbose=True)
+    
+    print("\n=== Optimization Result ===")
+    print(f"Best Min-Max Delay: {delay:.4f} s")
+    print(f"Sample K values: {k[:5]}")
+    print(f"Sample Lambda (Veh 0): {lam[0]}")
+    
+    # 4. 将结果应用到环境 (如果是实际仿真循环)
+    # env.ris.set_phases(ris)
+    # env.step_movement()
